@@ -220,7 +220,6 @@ mod tests {
                 pkt_num: pn,
                 frames: smallvec![],
                 time_sent: now,
-                time_acked: None,
                 time_lost: None,
                 size: mss,
                 ack_eliciting: true,
@@ -255,6 +254,7 @@ mod tests {
                 delivered_time: now,
                 first_sent_time: now.checked_sub(rtt).unwrap(),
                 is_app_limited: false,
+                in_flight: true,
             };
 
             r.delivery_rate.update_rate_sample(&acked, now);
@@ -284,7 +284,6 @@ mod tests {
                 pkt_num: pn,
                 frames: smallvec![],
                 time_sent: now,
-                time_acked: None,
                 time_lost: None,
                 size: mss,
                 ack_eliciting: true,
@@ -323,7 +322,6 @@ mod tests {
                 pkt_num: pn,
                 frames: smallvec![],
                 time_sent: now,
-                time_acked: None,
                 time_lost: None,
                 size: mss,
                 ack_eliciting: true,

@@ -1808,8 +1808,6 @@ impl Connection {
             conn.derived_initial_secrets = true;
         }
 
-        conn.paths.get_mut(active_path_id)?.recovery.on_init();
-
         Ok(conn)
     }
 
@@ -2603,7 +2601,7 @@ impl Connection {
         // Process acked frames. Note that several packets from several paths
         // might have been acked by the received packet.
         for (_, p) in self.paths.iter_mut() {
-            for acked in p.recovery.acked[epoch].drain(..) {
+            for acked in p.recovery.get_acked_frames(epoch) {
                 match acked {
                     frame::Frame::ACK { ranges, .. } => {
                         // Stop acknowledging packets less than or equal to the
@@ -2775,7 +2773,7 @@ impl Connection {
 
         // Reset pacer and start a new burst when a valid
         // packet is received.
-        self.paths.get_mut(recv_pid)?.recovery.pacer.reset(now);
+        // self.paths.get_mut(recv_pid)?.recovery.pacer.reset(now);
 
         Ok(read)
     }
@@ -3012,7 +3010,7 @@ impl Connection {
             // When sending multiple PTO probes, don't coalesce them together,
             // so they are sent on separate UDP datagrams.
             if let Ok(epoch) = ty.to_epoch() {
-                if self.paths.get_mut(send_pid)?.recovery.loss_probes[epoch] > 0 {
+                if self.paths.get_mut(send_pid)?.recovery.loss_probes(epoch) > 0 {
                     break;
                 }
             }
@@ -3080,7 +3078,7 @@ impl Connection {
 
         // Process lost frames. There might be several paths having lost frames.
         for (_, p) in self.paths.iter_mut() {
-            for lost in p.recovery.lost[epoch].drain(..) {
+            for lost in p.recovery.get_lost_frames(epoch) {
                 match lost {
                     frame::Frame::CryptoHeader { offset, length } => {
                         pkt_space.crypto_stream.send.retransmit(offset, length);
@@ -3264,22 +3262,18 @@ impl Connection {
         // Make sure we have enough space left for the packet overhead.
         match left.checked_sub(overhead) {
             Some(v) => left = v,
-
             None => {
                 // We can't send more because there isn't enough space available
                 // in the output buffer.
                 //
                 // This usually happens when we try to send a new packet but
-                // failed because cwnd is almost full. In such case app_limited
-                // is set to false here to make cwnd grow when ACK is received.
-                path.recovery.update_app_limited(false);
+                // failed because cwnd is almost full.
                 return Err(Error::Done);
             },
         }
 
         // Make sure there is enough space for the minimum payload length.
         if left < PAYLOAD_MIN_LEN {
-            path.recovery.update_app_limited(false);
             return Err(Error::Done);
         }
 
@@ -3934,14 +3928,11 @@ impl Connection {
 
         if ack_eliciting {
             path.needs_ack_eliciting = false;
-            path.recovery.loss_probes[epoch] =
-                path.recovery.loss_probes[epoch].saturating_sub(1);
+            path.recovery.ping_sent(epoch);
         }
 
         if frames.is_empty() {
-            // When we reach this point we are not able to write more, so set
-            // app_limited to false.
-            path.recovery.update_app_limited(false);
+            // When we reach this point we are not able to write more
             return Err(Error::Done);
         }
 
@@ -4064,7 +4055,6 @@ impl Connection {
             pkt_num: pn,
             frames,
             time_sent: now,
-            time_acked: None,
             time_lost: None,
             size: if ack_eliciting { written } else { 0 },
             ack_eliciting,
@@ -4077,7 +4067,7 @@ impl Connection {
         };
 
         if in_flight && is_app_limited {
-            path.recovery.delivery_rate_update_app_limited(true);
+            // path.recovery.delivery_rate_update_app_limited(true);
         }
 
         pkt_space.next_pkt_num += 1;
@@ -4112,10 +4102,6 @@ impl Connection {
         self.sent_bytes += written as u64;
         path.sent_count += 1;
         path.sent_bytes += written as u64;
-
-        if self.dgram_send_queue.byte_size() > path.recovery.cwnd_available() {
-            path.recovery.update_app_limited(false);
-        }
 
         path.max_send_bytes = path.max_send_bytes.saturating_sub(written);
 
@@ -5105,14 +5091,6 @@ impl Connection {
 
         self.dgram_send_queue.push(buf.to_vec())?;
 
-        let active_path = self.paths.get_active_mut()?;
-
-        if self.dgram_send_queue.byte_size() >
-            active_path.recovery.cwnd_available()
-        {
-            active_path.recovery.update_app_limited(false);
-        }
-
         Ok(())
     }
 
@@ -5134,14 +5112,6 @@ impl Connection {
         }
 
         self.dgram_send_queue.push(buf)?;
-
-        let active_path = self.paths.get_active_mut()?;
-
-        if self.dgram_send_queue.byte_size() >
-            active_path.recovery.cwnd_available()
-        {
-            active_path.recovery.update_app_limited(false);
-        }
 
         Ok(())
     }
@@ -6248,12 +6218,12 @@ impl Connection {
 
             // There are lost frames in this packet number space.
             for (_, p) in self.paths.iter() {
-                if !p.recovery.lost[epoch].is_empty() {
+                if p.recovery.has_lost_frames(epoch) {
                     return Ok(packet::Type::from_epoch(epoch));
                 }
 
                 // We need to send PTO probe packets.
-                if p.recovery.loss_probes[epoch] > 0 {
+                if p.recovery.loss_probes(epoch) > 0 {
                     return Ok(packet::Type::from_epoch(epoch));
                 }
             }
@@ -6346,7 +6316,7 @@ impl Connection {
 
                 for (_, p) in self.paths.iter_mut() {
                     if is_app_limited {
-                        p.recovery.delivery_rate_update_app_limited(true);
+                        // p.recovery.delivery_rate_update_app_limited(true);
                     }
 
                     let (lost_packets, lost_bytes) = p.recovery.on_ack_received(
@@ -6356,7 +6326,7 @@ impl Connection {
                         handshake_status,
                         now,
                         &self.trace_id,
-                    )?;
+                    );
 
                     self.lost_count += lost_packets;
                     self.lost_bytes += lost_bytes as u64;
@@ -8987,7 +8957,7 @@ mod tests {
             .get_active_mut()
             .expect("no active path")
             .recovery
-            .loss_probes[packet::Epoch::Initial] = 1;
+            .inc_loss_probes(packet::Epoch::Initial);
 
         let initial_path = pipe
             .server
@@ -12554,7 +12524,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             1,
         );
 
@@ -12566,7 +12536,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             0,
         );
 
@@ -12612,7 +12582,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             1,
         );
 
@@ -12625,7 +12595,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             0,
         );
 
@@ -12641,7 +12611,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             2,
         );
 
@@ -12654,7 +12624,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             1,
         );
 
@@ -12667,7 +12637,7 @@ mod tests {
                 .get_active()
                 .expect("no active")
                 .recovery
-                .loss_probes[epoch],
+                .loss_probes(epoch),
             0,
         );
     }
@@ -12845,20 +12815,13 @@ mod tests {
             assert_eq!(pipe.client.dgram_send(&send_buf), Ok(()));
         }
 
-        assert!(!pipe
-            .client
-            .paths
-            .get_active()
-            .expect("no active")
-            .recovery
-            .app_limited());
         assert_eq!(pipe.client.dgram_send_queue.byte_size(), 1_000_000);
 
         let (len, _) = pipe.client.send(&mut buf).unwrap();
 
         assert_ne!(pipe.client.dgram_send_queue.byte_size(), 0);
         assert_ne!(pipe.client.dgram_send_queue.byte_size(), 1_000_000);
-        assert!(!pipe
+        assert!(pipe
             .client
             .paths
             .get_active()
@@ -12877,7 +12840,7 @@ mod tests {
         assert_ne!(pipe.client.dgram_send_queue.byte_size(), 0);
         assert_ne!(pipe.client.dgram_send_queue.byte_size(), 1_000_000);
 
-        assert!(!pipe
+        assert!(pipe
             .client
             .paths
             .get_active()
